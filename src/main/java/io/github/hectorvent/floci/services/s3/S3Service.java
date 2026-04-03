@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
+import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.s3.model.*;
@@ -439,7 +440,13 @@ public class S3Service {
         }
     }
 
+    public record ListObjectsResult(List<S3Object> objects, List<String> commonPrefixes, boolean isTruncated) {}
+
     public List<S3Object> listObjects(String bucketName, String prefix, String delimiter, int maxKeys) {
+        return listObjectsWithPrefixes(bucketName, prefix, delimiter, maxKeys).objects();
+    }
+
+    public ListObjectsResult listObjectsWithPrefixes(String bucketName, String prefix, String delimiter, int maxKeys) {
         ensureBucketExists(bucketName);
 
         String keyPrefix = bucketName + "/";
@@ -453,21 +460,59 @@ public class S3Service {
                 .toList();
         allObjects = new ArrayList<>(allObjects);
 
+        // see https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-prefixes.html
+        List<String> commonPrefixes = List.of();
+
         if (delimiter != null && !delimiter.isEmpty()) {
-            // Filter to only return objects at this level (simulate directory listing)
-            allObjects = allObjects.stream()
-                    .filter(obj -> {
-                        String remainder = obj.getKey().substring(prefix != null ? prefix.length() : 0);
-                        return !remainder.contains(delimiter);
-                    })
-                    .toList();
+            Set<String> prefixSet = new LinkedHashSet<>();
+            List<S3Object> directObjects = new ArrayList<>();
+
+            for (S3Object obj : allObjects) {
+                String remainder = obj.getKey().substring(prefix != null ? prefix.length() : 0);
+                int delimIdx = remainder.indexOf(delimiter);
+                if (delimIdx >= 0) {
+                    String cp = (prefix != null ? prefix : "") + remainder.substring(0, delimIdx + delimiter.length());
+                    prefixSet.add(cp);
+                } else {
+                    directObjects.add(obj);
+                }
+            }
+
+            allObjects = directObjects;
+            commonPrefixes = new ArrayList<>(prefixSet);
+            Collections.sort(commonPrefixes);
         }
 
-        if (maxKeys > 0 && allObjects.size() > maxKeys) {
-            allObjects = allObjects.subList(0, maxKeys);
+        allObjects.sort(Comparator.comparing(S3Object::getKey));
+
+        // S3 counts both direct objects and common prefixes.
+        // Each common prefix group (e.g. "docs/") uses one entry regardless of
+        // how many keys it contains. Merge both sorted lists lexicographically
+        // and stop at maxKeys to try to match S3 ListObjectsV2 behavior.
+        // see https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+        boolean isTruncated = false;
+        if (maxKeys > 0) {
+            List<S3Object> limitedObjects = new ArrayList<>();
+            List<String> limitedPrefixes = new ArrayList<>();
+            int count = 0;
+            int directObjectCount = 0;
+            int commonPrefixCount = 0;
+            while (count < maxKeys && (directObjectCount < allObjects.size() || commonPrefixCount < commonPrefixes.size())) {
+                String objectKey = directObjectCount < allObjects.size() ? allObjects.get(directObjectCount).getKey() : null;
+                String prefixKey = commonPrefixCount < commonPrefixes.size() ? commonPrefixes.get(commonPrefixCount) : null;
+                if (objectKey != null && (prefixKey == null || objectKey.compareTo(prefixKey) <= 0)) {
+                    limitedObjects.add(allObjects.get(directObjectCount++));
+                } else {
+                    limitedPrefixes.add(commonPrefixes.get(commonPrefixCount++));
+                }
+                count++;
+            }
+            isTruncated = directObjectCount < allObjects.size() || commonPrefixCount < commonPrefixes.size();
+            allObjects = limitedObjects;
+            commonPrefixes = limitedPrefixes;
         }
 
-        return allObjects;
+        return new ListObjectsResult(allObjects, commonPrefixes, isTruncated);
     }
 
     public S3Object copyObject(String sourceBucket, String sourceKey,
@@ -908,6 +953,15 @@ public class S3Service {
                 .toList();
     }
 
+    public MultipartUpload listParts(String bucket, String key, String uploadId) {
+        MultipartUpload upload = multipartUploads.get(uploadId);
+        if (upload == null || !upload.getBucket().equals(bucket) || !upload.getKey().equals(key)) {
+            throw new AwsException("NoSuchUpload",
+                    "The specified multipart upload does not exist.", 404);
+        }
+        return upload;
+    }
+
     // --- Notification Configuration ---
 
     public void putBucketNotificationConfiguration(String bucketName, NotificationConfiguration config) {
@@ -959,6 +1013,96 @@ public class S3Service {
             throw new AwsException("NoSuchCORSConfiguration", "The CORS configuration does not exist", 404);
         }
         return bucket.getCorsConfiguration();
+    }
+
+    public record CorsEvalResult(
+        String allowedOrigin,
+        List<String> allowedMethods,
+        List<String> allowedHeaders,
+        List<String> exposeHeaders,
+        int maxAgeSeconds
+    ) {}
+
+    /**
+     * Evaluates a CORS request (preflight or actual) against the bucket's CORS configuration.
+     *
+     * @param bucketName     the bucket to check
+     * @param origin         the Origin header value from the browser request
+     * @param requestMethod  the Access-Control-Request-Method (for preflight) or the HTTP method (for actual requests)
+     * @param requestHeaders the Access-Control-Request-Headers values (may be empty for actual requests)
+     * @return the matching CORS rule details, or empty if no rule matches
+     */
+    public Optional<CorsEvalResult> evaluateCors(String bucketName, String origin,
+                                                  String requestMethod, List<String> requestHeaders) {
+        Bucket bucket = bucketStore.get(bucketName).orElse(null);
+        if (bucket == null || bucket.getCorsConfiguration() == null) return Optional.empty();
+
+        String corsXml = bucket.getCorsConfiguration();
+        List<Map<String, List<String>>> rules = XmlParser.extractGroupsMulti(corsXml, "CORSRule");
+
+        for (Map<String, List<String>> rule : rules) {
+            List<String> allowedOrigins = rule.getOrDefault("AllowedOrigin", List.of());
+            List<String> allowedMethods = rule.getOrDefault("AllowedMethod", List.of());
+            List<String> allowedHeaders = rule.getOrDefault("AllowedHeader", List.of());
+            List<String> exposeHeaders  = rule.getOrDefault("ExposeHeader",  List.of());
+            List<String> maxAgeList     = rule.getOrDefault("MaxAgeSeconds", List.of());
+            int maxAge = 0;
+            if (!maxAgeList.isEmpty()) {
+                String maxAgeRaw = maxAgeList.get(0);
+                if (maxAgeRaw != null) {
+                    String trimmed = maxAgeRaw.trim();
+                    if (!trimmed.isEmpty()) {
+                        try {
+                            maxAge = Integer.parseInt(trimmed);
+                        } catch (NumberFormatException ignored) {
+                            // Treat invalid MaxAgeSeconds as no max-age (equivalent to 0)
+                        }
+                    }
+                }
+            }
+
+            boolean originMatches = allowedOrigins.contains("*")
+                || (origin != null && allowedOrigins.stream().anyMatch(ao -> matchesCorsOrigin(ao, origin)));
+            if (!originMatches) continue;
+
+            if (requestMethod != null
+                    && allowedMethods.stream().noneMatch(m -> m.equalsIgnoreCase(requestMethod))) continue;
+
+            if (requestHeaders != null && !requestHeaders.isEmpty()) {
+                boolean headersOk = allowedHeaders.contains("*")
+                    || requestHeaders.stream().allMatch(rh ->
+                        allowedHeaders.stream().anyMatch(ah -> ah.equalsIgnoreCase(rh)));
+                if (!headersOk) continue;
+            }
+
+            String echoOrigin = allowedOrigins.contains("*") ? "*" : origin;
+            return Optional.of(new CorsEvalResult(echoOrigin, allowedMethods, allowedHeaders, exposeHeaders, maxAge));
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Matches an AllowedOrigin pattern against a concrete Origin header value.
+     *
+     * <p>AWS S3 CORS allows at most one {@code *} wildcard anywhere in the pattern
+     * (e.g. {@code *}, {@code http://*.example.com}, {@code http://app-*.example.com}).
+     * The {@code *} matches zero or more characters at that position in the origin string.
+     * The concrete Origin is always treated as an exact scheme+host+port string.
+     */
+    private static boolean matchesCorsOrigin(String pattern, String origin) {
+        if ("*".equals(pattern)) return true;
+        int star = pattern.indexOf('*');
+        if (star < 0) {
+            return pattern.equals(origin);
+        }
+        // Single wildcard: split into prefix and suffix around the '*'
+        String prefix = pattern.substring(0, star);
+        String suffix = pattern.substring(star + 1);
+        // The wildcard may match zero or more characters, so the origin must be at
+        // least as long as prefix+suffix combined (no overlap allowed).
+        return origin.length() >= prefix.length() + suffix.length()
+                && origin.startsWith(prefix)
+                && origin.endsWith(suffix);
     }
 
     public void putBucketCors(String bucketName, String cors) {
@@ -1090,7 +1234,7 @@ public class S3Service {
         String eventJson = buildS3EventJson(bucketName, key, eventName, obj, region, bucket.isVersioningEnabled());
 
         for (QueueNotification qn : config.getQueueConfigurations()) {
-            if (qn.events().stream().anyMatch(p -> matchesEvent(p, eventName))) {
+            if (qn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && qn.matchesKey(key)) {
                 try {
                     sqsService.sendMessage(sqsUrlFromArn(qn.queueArn()), eventJson, 0);
                     LOG.debugv("Fired S3 event {0} to SQS {1}", eventName, qn.queueArn());
@@ -1101,7 +1245,7 @@ public class S3Service {
         }
 
         for (TopicNotification tn : config.getTopicConfigurations()) {
-            if (tn.events().stream().anyMatch(p -> matchesEvent(p, eventName))) {
+            if (tn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && tn.matchesKey(key)) {
                 try {
                     snsService.publish(tn.topicArn(), null, eventJson, "Amazon S3 Notification", region);
                     LOG.debugv("Fired S3 event {0} to SNS {1}", eventName, tn.topicArn());
@@ -1283,12 +1427,14 @@ public class S3Service {
         return bucketName + "/" + key + "#v#" + versionId;
     }
 
+    private static final String DATA_SUFFIX = ".s3data";
+
     private Path resolveObjectPath(String bucketName, String key) {
-        return dataRoot.resolve(bucketName).resolve(key);
+        return dataRoot.resolve(bucketName).resolve(key + DATA_SUFFIX);
     }
 
     private Path resolveVersionedPath(String bucketName, String key, String versionId) {
-        return dataRoot.resolve(".versions").resolve(bucketName).resolve(key).resolve(versionId);
+        return dataRoot.resolve(".versions").resolve(bucketName).resolve(key).resolve(versionId + DATA_SUFFIX);
     }
 
     private void writeVersionedFile(String bucketName, String key, String versionId, byte[] data) {
